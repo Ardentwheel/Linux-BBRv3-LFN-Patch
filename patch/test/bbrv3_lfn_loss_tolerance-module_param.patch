@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bbr-lfn <builder@localhost>
+Date: Tue, 23 Jun 2026 00:00:00 +0000
+Subject: [PATCH] tcp_bbr: LFN dynamic loss threshold — tolerate higher
+ base loss on cross-border / long-fat paths
+
+ On long-fat networks (cross-border, RTT 150–300ms+) there is often a
+ 2–5% "background" physical-loss floor unrelated to congestion. Stock
+ BBRv3's 2% hard ceiling causes inflight_hi to be chopped prematurely,
+ preventing the flow from ever probing up to true bottleneck bandwidth.
+
+ This adds an RTT-gated relaxation: only during PROBE_BW *and NOT during
+ PROBE_UP*, and when the latest RTT sample shows no queue buildup
+ (rtt < 1.2 × min_rtt), the loss-threshold used inside
+ bbr_is_inflight_too_high() is allowed to rise from 2% →
+ bbr_lfn_loss_thresh_pct (default 5%, clamped 2–20%).
+
+ To avoid min_rtt_us aging or contamination issues, the relaxation is
+ only allowed when min_rtt_us has been refreshed within the last
+ min_rtt_win_sec (10 seconds). The freshness check uses time_before()
+ with explicit unsigned long casts to avoid Clang type warnings.
+
+ Runtime tuning:
+   echo 7 > /sys/module/tcp_bbr/parameters/bbr_lfn_loss_thresh_pct
+   echo 0 > /sys/module/tcp_bbr/parameters/bbr_lfn_loss_thresh_pct  # disable
+---
+ net/ipv4/tcp_bbr.c | 53 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -297,6 +297,11 @@
+ 
+ /* Estimate bw probing has gone too far if loss rate exceeds this level. */
+ static const u32 bbr_loss_thresh = BBR_UNIT * 2 / 100;  /* 2% loss */
++
++/* LFN Optimization: Dynamic loss threshold in percent for PROBE_BW mode */
++static int bbr_lfn_loss_thresh_pct __read_mostly = 5; /* Default 5% for cross-border LFN */
++module_param(bbr_lfn_loss_thresh_pct, int, 0644);
++MODULE_PARM_DESC(bbr_lfn_loss_thresh_pct, "LFN loss threshold in PROBE_BW (Percent 2-20, default 5)");
+ 
+ /* Slow down for a packet loss recovered by TLP? */
+ static const bool bbr_loss_probe_recovery = true;
+@@ -1163,21 +1168,68 @@
+ 
+ 	if (bbr->round_start)
+ 		bbr_raise_inflight_hi_slope(sk);
++}
++
++/* Check whether min_rtt_us is fresh enough to be trusted as a
++ * propagation-delay baseline. If min_rtt_us has not been refreshed
++ * within the last min_rtt_win_sec, it may be contaminated by queue
++ * residues or stale due to path changes.
++ *
++ * Uses time_before() to safely handle jiffies wraparound on long-running
++ * connections (e.g., ~49 day wrap at HZ=1000). Explicit casts to
++ * unsigned long avoid Clang type mismatch warnings.
++ */
++static bool bbr_min_rtt_is_fresh(const struct bbr *bbr)
++{
++	if (bbr->min_rtt_stamp == 0)
++		return false;
++
++	/* min_rtt_win_sec is defined as 10 seconds */
++	return !time_before((unsigned long)tcp_jiffies32,
++			    (unsigned long)(bbr->min_rtt_stamp +
++					    bbr_min_rtt_win_sec * HZ));
+ }
+ 
++/* Check whether RTT shows no meaningful queue buildup.
++ * Returns true only when rtt_us is reliably below 1.2 × min_rtt_us
++ * and min_rtt_us itself is fresh.
++ */
++
+ /* Does loss/ECN rate for this sample say inflight is "too high"?
+  * This is used by both the bbr_check_loss_too_high_in_startup() function,
+  * and in PROBE_UP.
+  */
++
+ static bool bbr_is_inflight_too_high(const struct sock *sk,
+ 				      const struct rate_sample *rs)
+ {
+-	const struct bbr *bbr = inet_csk_ca(sk);
+-	u32 loss_thresh, ecn_thresh;
++	struct bbr *bbr = inet_csk_ca(sk);
++	u32 loss_thresh, ecn_thresh, eff_loss = bbr_param(sk, loss_thresh);
++	int pct;
+ 
+ 	if (rs->lost > 0 && rs->tx_in_flight) {
+-		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
+-				BBR_SCALE;
++		/* --- LFN soft-scaling gatekeeper --------------------------------
++		 * Only relax the 2% ceiling during PROBE_BW, and ONLY when NOT in
++		 * PROBE_UP (where RTT lags behind queue buildup), and when the
++		 * latest RTT sample shows NO meaningful queue buildup:
++		 *   rtt_us < min_rtt × 1.2   ⇔   delay inflation < 20%
++		 *
++		 * min_rtt_us must also be fresh (< 10 sec) to avoid using
++		 * stale or queue-contaminated baselines.
++		 * ------------------------------------------------------------ */
++		pct = READ_ONCE(bbr_lfn_loss_thresh_pct);
++		if (pct > 0 &&
++		    bbr->mode == BBR_PROBE_BW &&
++		    bbr->cycle_idx != BBR_BW_PROBE_UP &&
++		    bbr_min_rtt_is_fresh(bbr) &&
++		    rs->rtt_us > 0 && bbr->min_rtt_us > 0 &&
++		    rs->rtt_us < (bbr->min_rtt_us * 6 / 5)) {
++			pct = clamp(pct, 2, 20);
++			eff_loss = max_t(u32, eff_loss,
++					 ((u32)pct * BBR_UNIT + 50) / 100);
++		}
++
++		loss_thresh = (u64)rs->tx_in_flight * eff_loss >> BBR_SCALE;
+ 		if (rs->lost > loss_thresh) {
+ 			return true;
+ 		}

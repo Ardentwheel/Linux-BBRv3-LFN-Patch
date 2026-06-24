@@ -1,0 +1,202 @@
+From 99c85f8aa57736f63679158d34a5f7adda73bade Mon Sep 17 00:00:00 2001
+From: Matthew Sheppard <conroy728960@gmail.com>
+Date: Thu, 25 Jun 2026 03:00:29 +0800
+Subject: [PATCH] tcp_bbr: add optional LFN loss tolerance via sysctl (disabled
+ by default)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cross-border and satellite links often exhibit 2–5% "physical" loss
+unrelated to congestion. Stock BBRv3 caps loss at a fixed 2%; once
+exceeded, it freezes inflight_hi and aborts the 1.25× probe.
+
+Introduce an optional mechanism to relax the 2% ceiling only under
+strict, AQM-safe conditions. Disabled by default (pct=0), preserving
+100% behavioral compatibility with upstream BBRv3.
+
+Relaxation triggers only if ALL hold:
+  1) mode == BBR_PROBE_BW && cycle_idx != BBR_BW_PROBE_UP
+  2) rtt_us < 1.2 × min_rtt_us
+  3) min_rtt_stamp age ≤ tcp_bbr_lfn_min_rtt_fresh_ms
+  4) tx_in_flight ≤ 1.15 × BDP(pkts)
+
+Implementation notes:
+  - Jiffies wraparound safety is guaranteed by canonical u32 subtraction.
+  - Read sysctl values only when needed (event-driven).
+
+Add two global sysctl parameters defined in net/ipv4/sysctl_net_ipv4.c
+under net.ipv4:
+
+  - net.ipv4.tcp_bbr_lfn_loss_thresh_pct (default 0, range 0–20)
+  - net.ipv4.tcp_bbr_lfn_min_rtt_fresh_ms (default 5000 ms, range 0–60000)
+
+They are global (not per-netns) and exported for use by the tcp_bbr
+module. This avoids module unloading / sysctl path lifecycle issues
+and aligns with how other TCP sysctls (e.g., tcp_ecn) are managed.
+
+The feature remains disabled by default (pct=0).
+
+Tested on Linux 6.13.7 (clang/LTO, ARM64).
+
+Based on the official BBRv3 implementation at:
+https://github.com/google/bbr/blob/
+90210de4b779d40496dee0b89081780eeddf2a60/net/ipv4/tcp_bbr.c
+
+Signed-off-by: Matthew <ardentwheel@gmail.com>
+---
+ include/net/tcp.h          |  4 +++
+ net/ipv4/sysctl_net_ipv4.c | 24 +++++++++++++
+ net/ipv4/tcp_bbr.c         | 70 +++++++++++++++++++++++++++++++++++---
+ 3 files changed, 94 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index cde248b77270..8bd75cfa2e56 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -261,6 +261,10 @@ static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
+ extern int sysctl_tcp_max_orphans;
+ extern long sysctl_tcp_mem[3];
+ 
++/* BBR LFN loss tolerance parameters */
++extern int sysctl_tcp_bbr_lfn_loss_thresh_pct;
++extern int sysctl_tcp_bbr_lfn_min_rtt_fresh_ms;
++
+ #define TCP_RACK_LOSS_DETECTION  0x1 /* Use RACK to detect losses */
+ #define TCP_RACK_STATIC_REO_WND  0x2 /* Use static RACK reo wnd */
+ #define TCP_RACK_NO_DUPTHRESH    0x4 /* Do not use DUPACK threshold in RACK */
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index a79b2a52ce01..c4c60468611f 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -46,6 +46,12 @@ static unsigned int udp_child_hash_entries_max = UDP_HTABLE_SIZE_MAX;
+ static int tcp_plb_max_rounds = 31;
+ static int tcp_plb_max_cong_thresh = 256;
+ 
++/* BBR LFN loss tolerance parameters (global, not per-netns) */
++int sysctl_tcp_bbr_lfn_loss_thresh_pct __read_mostly = 0;
++int sysctl_tcp_bbr_lfn_min_rtt_fresh_ms __read_mostly = 5000;
++EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_loss_thresh_pct);
++EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
++
+ /* obsolete */
+ static int sysctl_tcp_low_latency __read_mostly;
+ 
+@@ -594,6 +600,24 @@ static struct ctl_table ipv4_table[] = {
+ 		.proc_handler	= proc_dointvec,
+ 	},
+ #endif /* CONFIG_NETLABEL */
++	{
++		.procname	= "tcp_bbr_lfn_loss_thresh_pct",
++		.data		= &sysctl_tcp_bbr_lfn_loss_thresh_pct,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= &(int){20},
++	},
++	{
++		.procname	= "tcp_bbr_lfn_min_rtt_fresh_ms",
++		.data		= &sysctl_tcp_bbr_lfn_min_rtt_fresh_ms,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= &(int){60000},
++	},
+ 	{
+ 		.procname	= "tcp_available_ulp",
+ 		.maxlen		= TCP_ULP_BUF_MAX,
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index e09389c378cc..38805c66c514 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -1024,6 +1024,44 @@ static bool bbr_is_probing_bandwidth(struct sock *sk)
+ 		  bbr->cycle_idx == BBR_BW_PROBE_UP));
+ }
+ 
++/* Check whether min_rtt_us is fresh enough to be trusted as a
++ * propagation-delay baseline. Uses configurable freshness window.
++ */
++static bool bbr_min_rtt_is_fresh(const struct bbr *bbr)
++{
++	u32 fresh_ms;
++
++	if (bbr->min_rtt_stamp == 0)
++		return false;
++
++	/* Read sysctl value */
++	if (READ_ONCE(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms) == 0)
++		return true;
++
++	/* Convert jiffies delta to milliseconds, using time_before() for
++	 * jiffies wraparound safety.
++	 */
++	fresh_ms = jiffies_to_msecs(tcp_jiffies32 - bbr->min_rtt_stamp);
++
++	return fresh_ms <= READ_ONCE(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
++}
++
++/* Calculate inflight roof: 1.15 × BDP (to account for RTT lag in PROBE_BW) */
++static u32 bbr_inflight_roof(const struct sock *sk)
++{
++	u32 bdp_pkts;
++
++	/* BDP based on current max bw and target BDP fraction */
++	bdp_pkts = bbr_inflight((struct sock *)sk, bbr_max_bw(sk), BBR_UNIT);
++
++	/* 1.15× headroom to avoid false positives during queue buildup */
++	return ((u64)bdp_pkts * 115ULL) / 100ULL;
++}
++
++/* Check whether RTT shows no meaningful queue buildup.
++ * Returns true only when rtt_us is reliably below 1.2 × min_rtt_us.
++ */
++
+ /* Has the given amount of time elapsed since we marked the phase start? */
+ static bool bbr_has_elapsed_in_phase(const struct sock *sk, u32 interval_us)
+ {
+@@ -1172,12 +1210,36 @@ static void bbr_probe_inflight_hi_upward(struct sock *sk,
+ static bool bbr_is_inflight_too_high(const struct sock *sk,
+ 				      const struct rate_sample *rs)
+ {
+-	const struct bbr *bbr = inet_csk_ca(sk);
+-	u32 loss_thresh, ecn_thresh;
++	struct bbr *bbr = inet_csk_ca(sk);
++	u32 loss_thresh, ecn_thresh, eff_loss = bbr_param(sk, loss_thresh);
++	int pct;
+ 
+ 	if (rs->lost > 0 && rs->tx_in_flight) {
+-		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
+-				BBR_SCALE;
++		/* Read sysctl only when we actually need it */
++		pct = READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct);
++
++		if (pct > 0 &&
++		    bbr->mode == BBR_PROBE_BW &&
++		    bbr->cycle_idx != BBR_BW_PROBE_UP &&        /* Exclude PROBE_UP */
++		    bbr_min_rtt_is_fresh(bbr) &&                /* Fresh min_rtt */
++		    rs->rtt_us > 0 && bbr->min_rtt_us > 0 &&
++		    rs->rtt_us < (bbr->min_rtt_us * 6 / 5)) {   /* No queue buildup */
++
++			u32 roof = bbr_inflight_roof(sk);
++
++			/* Inflight roof guard: if already above 1.15×BDP,
++			 * loss is likely self-inflicted probe overshoot,
++			 * not background physical loss.
++			 */
++			if (rs->tx_in_flight > roof)
++				goto skip_relax;
++
++			pct = clamp(pct, 2, 20);
++			eff_loss = max_t(u32, eff_loss,
++					 ((u32)pct * BBR_UNIT + 50) / 100);
++		}
++skip_relax:
++		loss_thresh = (u64)rs->tx_in_flight * eff_loss >> BBR_SCALE;
+ 		if (rs->lost > loss_thresh) {
+ 			return true;
+ 		}
+-- 
+2.39.5 (Apple Git-154)
+
