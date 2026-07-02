@@ -1,0 +1,272 @@
+From cfb5dbe2c43fd631669aab56c305e23d2f4fa99c Mon Sep 17 00:00:00 2001
+From: Matthew Sheppard <conroy728960@gmail.com>
+Date: Mon, 29 Jun 2026 13:08:16 +0800
+Subject: [PATCH] tcp_bbr: add optional LFN loss tolerance via sysctl (disabled
+ by default)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cross-border WANs, satellite links, and high-BDP radio paths often exhibit
+2–5% "physical" loss unrelated to congestion (e.g., LEO handovers, FEC
+inefficiencies, shallow outer space links). Stock BBRv3 caps loss at a
+fixed 2% ceiling; once exceeded, it reacts aggressively:
+  a) Freezes inflight_hi (long-term upper bound)
+  b) Multiplicatively cuts bw_lo/inflight_lo by (1 - beta)
+  c) In STARTUP, exits to DRAIN prematurely
+
+On long-fat pipes, this causes severe under-utilization: a 300ms RTT
+cross-border link may never exceed 100Mbps despite a 500Mbps physical
+ceiling.
+
+This patch introduces an optional mechanism to relax the 2% ceiling *only*
+under strict, AQM-safe conditions. It is disabled by default (pct=0),
+preserving 100% behavioral compatibility with upstream BBRv3.
+
+Relaxation triggers only if ALL of the following hold:
+  1) mode == BBR_PROBE_BW && cycle_idx != BBR_BW_PROBE_UP
+     OR mode == BBR_STARTUP
+  2) rtt_us < 1.2 × min_rtt_us  (no measurable queue buildup)
+  3) min_rtt_stamp fresh ≤ tcp_bbr_lfn_min_rtt_fresh_ms
+  4) inflight_latest ≤ 1.15 × BDP (not self-inflicted probe overshoot)
+
+This ensures we only tolerate loss when it is statistically unlikely to be
+caused by queueing or over-probing.
+
+Changes:
+  - bbr_is_inflight_too_high(): Relax loss/ECN thresholds if eligible.
+    Both loss and ECN branches remain independent, matching upstream logic.
+  - bbr_adapt_upper_bounds(): Skip inflight_hi freeze if eligible.
+    Symmetric with the lower-bounds exemption.
+  - bbr_loss_lower_bounds(): Skip the (1-beta) multiplicative cut if eligible.
+  - STARTUP loss exit: Inherits relaxed threshold via bbr_is_inflight_too_high().
+  - sysctl: Add net.ipv4.tcp_bbr_lfn_loss_thresh_pct (0–20%, default 0)
+            Add net.ipv4.tcp_bbr_lfn_min_rtt_fresh_ms (0–60000ms, default 15000)
+
+The default min_rtt_fresh_ms is raised to 15000ms to accommodate RTT jitter
+common in long-haul and satellite environments.
+
+This complements existing BBRv3 logic rather than replacing it. When
+tcp_bbr_lfn_loss_thresh_pct=0 (default), the generated code path adds
+negligible overhead (two global reads and a few comparisons).
+
+Tested on Linux 6.13.7 (clang/LTO, ARM64).
+
+Based on the official BBRv3 implementation at:
+https://github.com/google/bbr/blob/90210de4b779d40496dee0b89081780eeddf2a60/net/ipv4/tcp_bbr.c
+
+Signed-off-by: Matthew <ardentwheel@gmail.com>
+---
+ include/net/tcp.h          |  4 ++
+ net/ipv4/sysctl_net_ipv4.c | 24 ++++++++++
+ net/ipv4/tcp_bbr.c         | 96 +++++++++++++++++++++++++++++++++++---
+ 3 files changed, 118 insertions(+), 6 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index cde248b77270..8bd75cfa2e56 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -261,6 +261,10 @@ static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
+ extern int sysctl_tcp_max_orphans;
+ extern long sysctl_tcp_mem[3];
+ 
++/* BBR LFN loss tolerance parameters */
++extern int sysctl_tcp_bbr_lfn_loss_thresh_pct;
++extern int sysctl_tcp_bbr_lfn_min_rtt_fresh_ms;
++
+ #define TCP_RACK_LOSS_DETECTION  0x1 /* Use RACK to detect losses */
+ #define TCP_RACK_STATIC_REO_WND  0x2 /* Use static RACK reo wnd */
+ #define TCP_RACK_NO_DUPTHRESH    0x4 /* Do not use DUPACK threshold in RACK */
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index a79b2a52ce01..2886a5745096 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -46,6 +46,12 @@ static unsigned int udp_child_hash_entries_max = UDP_HTABLE_SIZE_MAX;
+ static int tcp_plb_max_rounds = 31;
+ static int tcp_plb_max_cong_thresh = 256;
+ 
++/* BBR LFN loss tolerance parameters (global, not per-netns) */
++int sysctl_tcp_bbr_lfn_loss_thresh_pct __read_mostly = 0;
++int sysctl_tcp_bbr_lfn_min_rtt_fresh_ms __read_mostly = 15000;
++EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_loss_thresh_pct);
++EXPORT_SYMBOL(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
++
+ /* obsolete */
+ static int sysctl_tcp_low_latency __read_mostly;
+ 
+@@ -594,6 +600,24 @@ static struct ctl_table ipv4_table[] = {
+ 		.proc_handler	= proc_dointvec,
+ 	},
+ #endif /* CONFIG_NETLABEL */
++	{
++		.procname	= "tcp_bbr_lfn_loss_thresh_pct",
++		.data		= &sysctl_tcp_bbr_lfn_loss_thresh_pct,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= &(int){20},
++	},
++	{
++		.procname	= "tcp_bbr_lfn_min_rtt_fresh_ms",
++		.data		= &sysctl_tcp_bbr_lfn_min_rtt_fresh_ms,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= &(int){60000},
++	},
+ 	{
+ 		.procname	= "tcp_available_ulp",
+ 		.maxlen		= TCP_ULP_BUF_MAX,
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index e09389c378cc..346f34cfbb0d 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -1024,6 +1024,68 @@ static bool bbr_is_probing_bandwidth(struct sock *sk)
+ 		  bbr->cycle_idx == BBR_BW_PROBE_UP));
+ }
+ 
++/* ---- LFN guard (shared by upper / lower / startup paths) ---- */
++
++static bool bbr_min_rtt_is_fresh(const struct bbr *bbr)
++{
++	u32 limit_ms;
++
++	if (bbr->min_rtt_stamp == 0)
++		return false;
++	limit_ms = READ_ONCE(sysctl_tcp_bbr_lfn_min_rtt_fresh_ms);
++	if (limit_ms == 0)
++		return true;
++	return jiffies_to_msecs(tcp_jiffies32 - bbr->min_rtt_stamp) <= limit_ms;
++}
++
++static u32 bbr_inflight_roof(const struct sock *sk)
++{
++	u32 bdp = bbr_inflight((struct sock *)sk, bbr_max_bw(sk), BBR_UNIT);
++	return ((u64)bdp * 115ULL) / 100ULL;
++}
++
++/**
++ * bbr_lfn_eligible - is this loss episode plausibly "physical, not congestion"?
++ *
++ * Upper/lower (PROBE_BW, non-PROBE_UP):
++ *   1) mode == BBR_PROBE_BW && cycle_idx != BBR_BW_PROBE_UP
++ *   2) rtt_us < 1.2 × min_rtt_us   (no queue buildup)
++ *   3) min_rtt fresh
++ *   4) inflight_latest ≤ 1.15 × BDP (not self-inflicted probe overshoot)
++ *
++ * Startup:
++ *   1') mode == BBR_STARTUP
++ *   2') 3') 4')  same as above
++ */
++static bool bbr_lfn_eligible(const struct sock *sk,
++			     const struct rate_sample *rs)
++{
++	struct bbr *bbr = inet_csk_ca(sk);
++	bool in_startup, in_probe_bw_steady;
++
++	in_startup = (bbr->mode == BBR_STARTUP);
++	in_probe_bw_steady = (bbr->mode == BBR_PROBE_BW &&
++			      bbr->cycle_idx != BBR_BW_PROBE_UP);
++
++	if (!in_startup && !in_probe_bw_steady)
++		return false;
++	if (!bbr_min_rtt_is_fresh(bbr))
++		return false;
++	if (rs->rtt_us <= 0 || bbr->min_rtt_us <= 0 ||
++	    rs->rtt_us >= (bbr->min_rtt_us * 6 / 5))
++		return false;
++	if (bbr->inflight_latest > bbr_inflight_roof(sk))
++		return false;
++	return true;
++}
++
++/* Convert pct [2..20] to BBR_SCALE fraction (same math as bbr_param loss_thresh) */
++static u32 bbr_pct_to_scale(int pct)
++{
++	pct = clamp(pct, 2, 20);
++	return ((u32)pct * BBR_UNIT + 50) / 100;
++}
++
+ /* Has the given amount of time elapsed since we marked the phase start? */
+ static bool bbr_has_elapsed_in_phase(const struct sock *sk, u32 interval_us)
+ {
+@@ -1174,10 +1236,14 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
+ {
+ 	const struct bbr *bbr = inet_csk_ca(sk);
+ 	u32 loss_thresh, ecn_thresh;
++	u32 eff_loss = bbr_param(sk, loss_thresh);
++	u32 eff_ecn  = bbr_param(sk, ecn_thresh);
++	int pct= READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct);
+ 
+ 	if (rs->lost > 0 && rs->tx_in_flight) {
+-		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
+-				BBR_SCALE;
++		if (pct > 0 && bbr_lfn_eligible(sk, rs))
++			eff_loss = max_t(u32, eff_loss, bbr_pct_to_scale(pct));
++		loss_thresh = (u64)rs->tx_in_flight * eff_loss >> BBR_SCALE;
+ 		if (rs->lost > loss_thresh) {
+ 			return true;
+ 		}
+@@ -1185,8 +1251,9 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
+ 
+ 	if (rs->delivered_ce > 0 && rs->delivered > 0 &&
+ 	    bbr->ecn_eligible && !!bbr_param(sk, ecn_thresh)) {
+-		ecn_thresh = (u64)rs->delivered * bbr_param(sk, ecn_thresh) >>
+-				BBR_SCALE;
++		if (pct > 0 && bbr_lfn_eligible(sk, rs))
++			eff_ecn = max_t(u32, eff_ecn, bbr_pct_to_scale(pct));
++		ecn_thresh = (u64)rs->delivered * eff_ecn >> BBR_SCALE;
+ 		if (rs->delivered_ce > ecn_thresh) {
+ 			return true;
+ 		}
+@@ -1333,11 +1400,21 @@ static void bbr_init_lower_bounds(struct sock *sk, bool init_bw)
+ }
+ 
+ /* Reduce bw and inflight to (1 - beta). */
+-static void bbr_loss_lower_bounds(struct sock *sk, u32 *bw, u32 *inflight)
++static void bbr_loss_lower_bounds(struct sock *sk,
++				  const struct rate_sample *rs,
++				  u32 *bw, u32 *inflight)
+ {
+ 	struct bbr* bbr = inet_csk_ca(sk);
+ 	u32 loss_cut = BBR_UNIT - bbr_param(sk, beta);
+ 
++	/* LFN: if eligible, skip the (1-beta) cut entirely */
++	if (READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct) > 0 &&
++	    bbr_lfn_eligible(sk, rs)) {
++		*bw = bbr->bw_lo;
++		*inflight = bbr->inflight_lo;
++		return;
++	}
++
+ 	*bw = max_t(u32, bbr->bw_latest,
+ 		    (u64)bbr->bw_lo * loss_cut >> BBR_SCALE);
+ 	*inflight = max_t(u32, bbr->inflight_latest,
+@@ -1390,7 +1467,7 @@ static void bbr_adapt_lower_bounds(struct sock *sk,
+ 	/* Loss response. */
+ 	if (bbr->loss_in_round) {
+ 		bbr_init_lower_bounds(sk, true);
+-		bbr_loss_lower_bounds(sk, &bbr->bw_lo, &bbr->inflight_lo);
++		bbr_loss_lower_bounds(sk, rs, &bbr->bw_lo, &bbr->inflight_lo);
+ 	}
+ 
+ 	/* Adjust to the lower of the levels implied by loss/ECN. */
+@@ -1685,6 +1762,13 @@ static bool bbr_adapt_upper_bounds(struct sock *sk,
+ 		}
+ 	}
+ 	if (bbr_is_inflight_too_high(sk, rs)) {
++		/* LFN: if eligible, skip the inflight_hi freeze entirely.
++		 * Symmetric with bbr_loss_lower_bounds() exemption.
++		 */
++		if (READ_ONCE(sysctl_tcp_bbr_lfn_loss_thresh_pct) > 0 &&
++		    bbr_lfn_eligible(sk, rs))
++			return false;
++
+ 		if (bbr->bw_probe_samples)  /*  sample is from bw probing? */
+ 			bbr_handle_inflight_too_high(sk, rs);
+ 	} else {
+-- 
+2.39.5 (Apple Git-154)
+
