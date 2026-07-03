@@ -94,6 +94,21 @@ https://github.com/Ardentwheel/Linux-BBRv3-LFN-Patch/raw/main/patches/0001-tcp_b
 git apply bbr-lfn.patch
 ```
 
+#### ⚠️ 修补 CVE-2026-53235：Linux 内核 GRO 数据拉取漏洞
+
+ > 此问题并非本 LFN 补丁引入，而是 Linux 6.13.y 主线内核自带缺陷，<br>
+ > 在 Oracle Cloud / AWS / 任何 virtio_net + GRO 的 KVM 虚拟机上均可触发，<br>
+ > 表现为 **服务器周期性 Kernel Panic 需要强制重启。**
+
+```bash
+wget -O gro-fix-pskb_may_pull.patch \
+https://github.com/Ardentwheel/Linux-BBRv3-LFN-Patch/raw/main/patches/0001-net-add-pskb_may_pull-to-skb_gro_receive_list.patch
+git apply gro-fix-pskb_may_pull.patch
+```
+
+> [CVE-2026-53235][2] 是 Linux 内核 skb_gro_receive_list() 函数中的一个数据处理缺陷。<br>
+> 当某个特定序列的 TCP 段到达时，skb_gro_offset(skb) 大于 skb->len，skb_pull 中的 BUG_ON 触发，内核在 softirq 上下文崩溃。
+
 ### 3. 配置内核
 
 复用当前内核配置，自动补齐新参数：
@@ -128,7 +143,7 @@ make -j$(nproc) LLVM=1 LLVM_IAS=1 \
 
 ```bash
 # 仅清理受影响的编译产物，大幅缩短编译时间
-rm -f net/ipv4/sysctl_net_ipv4.o net/ipv4/tcp_bbr.o net/ipv4/tcp_bbr.mod*
+rm -f net/core/gro.o net/ipv4/sysctl_net_ipv4.o net/ipv4/tcp_bbr.o net/ipv4/tcp_bbr.mod*
 # make...
 ```
 
@@ -285,3 +300,4 @@ GPLv2，与 Linux 内核协议一致。
 💡 小贴士：如果发现任何问题或有改进建议，欢迎提交 Issue 或 PR！
 
 [1]: <https://github.com/google/bbr/blob/90210de4b779d40496dee0b89081780eeddf2a60/net/ipv4/tcp_bbr.c>
+[2]: <https://www.sentinelone.com/vulnerability-database/cve-2026-53235/>
