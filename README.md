@@ -275,7 +275,7 @@ A: 内核 ≥6.13 的 OpenWrt 可试，但 `sysctl_net_ipv4.c` 上下文可能�
 ## 📝 版本更新日志
 
 ### v3 (Current)
-- **ECN 对称放松**：修复 v2 中 ECN 分支误用 `eff_loss` 变量的致命 bug，同时对 loss 和 ECN 阈值进行对称放松。
+- **ECN 对称放松**：对 loss 和 ECN 阈值进行对称放松。
 - **Upper Bound 豁免**：在 `bbr_adapt_upper_bounds()` 中，符合 LFN 条件时完全跳过 `inflight_hi` 冻结（v2 仅放松阈值），实现上下界对称豁免。
 - **Startup 优化**：Startup 阶段的丢包退出逻辑继承 pct 阈值，避免跨境链路因物理丢包过早切 DRAIN。
 - **参数调整**：`tcp_bbr_lfn_min_rtt_fresh_ms` 默认值从 5000ms 提升至 15000ms，适应跨境 RTT 抖动。
