@@ -17,7 +17,7 @@ LFN 补丁在高丢包跨境链路上维持高吞吐的核心机制，依赖于*
 
 | qdisc | 默认参数<br>+ LFN 补丁 | 调参后<br>+ LFN 补丁 | 核心控制机理与对决表现 | 最佳生产场景 |
 |:---:|:---:|:---:|:---:|:---:|
-| **fq** | ✅ 四条件恒真<br>豁免最充分 | 无需调整<br>（原生驱动级 EDT） | 零污染时延采样，<br>自带稀疏流绝对插队保护，开销极低。 | **弹性/廉价大带宽**<br>跨境多业务通用首选 |
+| **fq** | ✅ 四条件恒真<br>豁免最充分 | 无需调整<br>（原生驱动级 EDT） | EDT 零缓存（积压仅 1-2 个 TSO 段），`new_flows`/`old_flows` 双链 sparse 插队（出队顺序维度时延隔离），开销极低。 | **弹性/廉价大带宽**<br>跨境多业务通用首选 |
 | **fq_codel** | ⚠️ target=5ms<br>对长 RTT 极度敏感 | target → 15ms<br>interval → 300ms | 容易引发非限速状态下的<br>定时器脉冲毛刺，误杀补丁。 | 数据中心内部<br>或挂载 HTB 硬限速 |
 | **fq_pie** | ✅ target=15m<br>天生相对平滑 | target → 20ms<br>tupdate → 30ms | 比例积分控制较为温和，<br>但无 EDT 支持，高并发下仍有毛刺。 | 追求 PIE 平滑性的<br>中轻载长肥网络 |
 | **cake(shaped)** | ⚠️ 默认 internet<br>配置容易打架 | 显式指定<br>→ oceanic / satellite | 本地强行构筑大坝，大 Target 容忍微观抖动，流隔离极强。 | **高价/优质固定线路**<br>边界网关多业务控制 |
@@ -31,14 +31,28 @@ LFN 补丁在高丢包跨境链路上维持高吞吐的核心机制，依赖于*
 
 ### 🔬 交互分析
 
-`fq` 是 BBR 的原生搭档。它通过 **EDT (Earliest Delivery Time)** 机制配合 BBR 的 pacing，在网卡驱动层精准控制发包，自身几乎不缓存数据包（将压力退回至 Socket 本身）。
+`fq` 是 BBR 的原生搭档，由 Eric Dumazet 设计，其核心定位是**调度器而非 AQM**。它通过 **Earliest Departure Time (EDT)** 将发包节奏决策权交还 TCP 层，使得本地 qdisc 积压（backlog）被压制在 1–2 个 TSO 聚合段量级。这种机制**显著削弱了本地 Bufferbloat**，将 bloat 压力推回 socket 层（需配合 `tcp_notsent_lowat` 调参闭环），从而最大程度地保证了 LFN 补丁四条件 Guard 的置信度：
 
-- **RTT 条件**: 由于 `fq` 不制造系统级队列堆积，本地 Qdisc Bufferbloat 永远为 0，`rtt_us` 几乎总是等于线路纯净传播延迟，因此 `rtt < 1.2×min_rtt` **恒成立**。
-- **Inflight 条件**: `fq` 的 `flow_limit` 仅作为防恶意流量的上限，BBR 自身的 `cwnd` 通常远低于此值，因此 `inflight_latest <= 1.15×BDP` **恒成立**。
+- **RTT 条件**: 
+由于 fq 消除了 Qdisc 层的排队时延，`rtt_us` 采样值几乎完全等同于链路的**纯净传播时延（Propagation Delay）**。这确保了 `rtt_us < 1.2×min_rtt` 极少被本地噪声误触，让补丁能精准识别真实的网络抖动而非本地队列阻塞。
+
+- **Inflight 条件**: 
+`flow_limit` 在此充当**安全上限（Safety Valve）**，仅用于防御哈希冲突或恶意流量，而非日常流控。在正常 BBR 行为下，其自主计算的 `cwnd` 远低于此阈值。fq 不干预 BBR 的窗口决策，使得 `inflight_latest` 能稳定维持在 1.15×BDP 的容忍区间内，避免了因 qdisc 层强制缓冲导致的 inflight 虚高。
+
+
+### 📌 **Sparse Flow 优先机制（常被忽视，多业务混跑杀手锏）**
+
+在上述基础之上，fq 引入了 `new_flows` / `old_flows` 双链表机制，实现**出队顺序维度时延隔离**（区别于 cake DRR 的带宽维度隔离），在"大流挤小包"场景下疗效优于 AQM 轮询语义。因此 fq 对 BBRv3-LFN 混跑场景是「EDT 调度器 + 本地 bloat 压制 + sparse 出队隔离」三位一体，而非 AQM 本身。
+
+#### **机制要点：**
+
+- **双链调度**：新 flow 或静默后苏醒 flow 首包入 `new_flows` 头部；出队时 `new_flows` 整体优先于 `old_flows`。
+- **插队保质期**：该 flow 连续发满一个 `quantum`（如 12500B ≈ 8×1500）用尽 credit 后，移入 `old_flows` 尾部参与 RR。**"sparse 优先"保质期为单 quantum，非永久**——"无条件"应理解为"单 quantum 内无条件插队"。
+- **维度压制**：Nextcloud 长时流钉在 `old_flows` 时，Typecho TTFB / Xray 控制帧等突发小包新 flow 自 `new_flows` 头插直出，不被 bulk 队列深度拖累；cake 的 `triple-isolate` 仍需小包等大流 current round 配额耗尽，维度不同。
 
 ### 结论
 
-在 `fq` 下，四条件 Guard 几乎总是放行，补丁豁免最为充分。无需任何参数调整，CPU 算力开销最低。
+**「EDT 调度器 + 本地 bloat 压制 + sparse 出队隔离」** 三位一体，使得 fq 成为 BBRv3-LFN 在波动带宽环境下的唯一最优解。叠加 fq 原生 EDT → 四条件 Guard 几乎恒真（哈希碰撞/TSO 突发除外，概率极低）→ 补丁豁免充分，形成完美闭环。
 
 ---
 
@@ -51,6 +65,7 @@ CoDel（受控延迟）算法的核心逻辑是：当数据包在队列中的驻
 默认的 `target=5ms` 是基于本地数据中心或超低延迟局域网设计的。对于跨境长肥网络（LFN，RTT 通常在 150ms~300ms 之间）而言，这个门限过于苛刻（仅占总时延的 2.5%）。
 
 - **RTT 条件**: CoDel 的特点是“无队列时不丢包，一丢包队列即清空”。这意味着丢包瞬间 `rtt_us` 可能并未显著上升（队列已空），导致 `rtt < 1.2×min_rtt` 依然成立。**四条件中的 RTT 门限无法有效拦截 CoDel 的主动丢包**。
+
 - **Inflight 条件**: 当本地因为混合业务（如大文件上传）引发极短暂的排队时，fq_codel 会瞬间被 5ms 门限激惹，发起密集的强制主动丢包（Drop）。这会瞬间冲爆 LFN 补丁的 inflight <= 1.15 × BDP 上限屋顶，补丁误判定其为“真性严重拥塞”，从而强行关闭高丢包豁免，逼迫 BBRv3 陷入恐慌减窗。
 
 ### 🛠️ 调优建议
@@ -255,14 +270,19 @@ EOF
 sudo sysctl -p
 
 ```
+---
+
+## FQ 优化 
+
+关于 FQ Quantum 参数相关的调度优化，请参考[自动适配多队列的fq配置脚本][1]部分
 
 ---
 
-*撰写参考: [tc-fq(8)][1], [tc-fq_codel(8)][2], [tc-fq_pie(8)][2], [tc-cake(8)][4]*
+*撰写参考: [tc-fq(8)][2], [tc-fq_codel(8)][3], [tc-fq_pie(8)][4], [tc-cake(8)][5]*
 
 
-[1]: <https://man.archlinux.org/man/tc-fq.8.en>
-[2]: <https://man.archlinux.org/man/tc-fq_codel.8.en>
-[3]: <https://man.archlinux.org/man/tc-fq_pie.8.en>
-[4]: <https://man.archlinux.org/man/tc-cake.8.en>
-
+[1]: <https://blog.inclouds.top/index.php/archives/9/#cl-6>
+[2]: <https://man.archlinux.org/man/tc-fq.8.en>
+[3]: <https://man.archlinux.org/man/tc-fq_codel.8.en>
+[4]: <https://man.archlinux.org/man/tc-fq_pie.8.en>
+[5]: <https://man.archlinux.org/man/tc-cake.8.en>
