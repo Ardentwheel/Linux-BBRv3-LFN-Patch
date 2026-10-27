@@ -1,6 +1,6 @@
 # BBRv3 LFN Loss Tolerance Patch
 
-> 为 Linux 6.13+ 的 BBRv3 添加长肥管道（LFN）丢包容忍能力，解决跨境/卫星链路物理丢包导致的吞吐受限问题
+> 为 Linux 7.0+ 的 BBRv3 添加长肥管道（LFN）丢包容忍能力，解决跨境/卫星链路物理丢包导致的吞吐受限问题
 
 ⚠️ **重要警告**
 
@@ -25,11 +25,12 @@ BBRv3 默认将丢包率上限锁定为 2%，在跨境、卫星等长肥管道�
 
 ## 📎 实现溯源
 
-本补丁基于 Google 官方 BBRv3 仓库（对应 Linux 6.13+ 主线内核中的 BBRv3 代码）[tcp_bbr.c][1]。
+本补丁基于 Xanmod 发行版内核仓库中的 BBRv3 代码 [tcp_bbr.c][1]。
 
-核心修改围绕原版 `bbr_loss_thresh=2%` / `bbr_ecn_thresh=50%` 展开，所有扩展逻辑均严格遵循
+核心修改围绕原版 `bbr_loss_thresh=2%` 展开，所有扩展逻辑均严格遵循
 BBRv3 的拥塞控制设计原则，确保兼容性和行为一致性。
 
+已基于 Xanmod 发行版 [Linux 7.3.0-xanmod1 31c6dfda][2] 编译测试正常运行。
 
 ---
 
@@ -51,7 +52,7 @@ PROBE_UP 阶段**故意不参与豁免**——1.25× 爬坡的 abort 是 BBRv3 �
 ## 🚀 功能特性
 
 - ✅ **三处对称豁免**：
-  - **`bbr_is_inflight_too_high()`**：loss/ECN 阈值替换 pct（loss 2%→pct, ECN 50%→pct）
+  - **`bbr_is_inflight_too_high()`**：loss 阈值替换 pct（loss 2%→pct）
   - **`bbr_adapt_upper_bounds()`**：eligible 时直接 return，**连 inflight_hi 冻结都免**（v2 只松阈值）
   - **`bbr_loss_lower_bounds()`**：eligible 时跳过 (1-beta) 砍刀
   - **STARTUP loss exit**：通过 `bbr_is_inflight_too_high()` 传导 pct，≥6 discontiguous loss 保留
@@ -59,18 +60,21 @@ PROBE_UP 阶段**故意不参与豁免**——1.25× 爬坡的 abort 是 BBRv3 �
 - ✅ **全编译器兼容**：内核标准 jiffies 处理，GCC/Clang 通吃
 - ✅ **配置简单**：全局 sysctl，无需 per-netns
 - ✅ **AQM 友好**：1.15×BDP 屋顶 + 四条件 guard，fq/fq_pie/fq_codel/cake 均安全
-- ✅ **多架构**：ARM64/x86_64，Clang LTO 验证通过
+- ✅ **多架构**：ARM64/x86_64，支持 Clang LTO
 - ✅ **符合内核规范**：代码风格、符号导出对齐原生 TCP sysctl
 
 ---
 
 ## 📋 前置要求
 
-- Linux 内核版本 ≥ 6.13
+- Linux 内核版本 ≥ 7.0
 - 编译依赖：
   ```bash
-  sudo apt install -y build-essential libncurses-dev bison flex \
-                      libssl-dev libelf-dev bc git clang lld
+  sudo apt install -y build-essential \
+     libdw-dev binutils-dev libssl-dev \
+     flex bison libncurses-dev libelf-dev rsync kmod cpio \
+     debhelper debhelper-compat dwarves \
+     bc wget git clang lld llvm make
   ```
 
 ---
@@ -80,8 +84,8 @@ PROBE_UP 阶段**故意不参与豁免**——1.25× 爬坡的 abort 是 BBRv3 �
 ### 1. 获取内核源码
 
 ```bash
-git clone -b v3 https://github.com/google/bbr.git --depth=1
-cd bbr
+git clone https://gitlab.com/xanmod/linux.git xanmod-linux --depth=1
+cd xanmod-linux
 ```
 
 ### 2. 应用补丁
@@ -94,24 +98,14 @@ https://github.com/Ardentwheel/Linux-BBRv3-LFN-Patch/raw/main/patches/0001-tcp_b
 git apply bbr-lfn.patch
 ```
 
-#### ⚠️ 修补 CVE-2026-53235：Linux 内核 GRO 数据拉取漏洞
-
- > 此问题并非本 LFN 补丁引入，而是 Linux 6.13.y 主线内核自带缺陷，<br>
- > 在 Oracle Cloud / AWS / 任何 virtio_net + GRO 的 KVM 虚拟机上均可触发，<br>
- > 表现为 **服务器周期性 Kernel Panic 需要强制重启。**
-
-```bash
-wget -O gro-fix-pskb_may_pull.patch \
-https://github.com/Ardentwheel/Linux-BBRv3-LFN-Patch/raw/main/patches/0001-net-add-pskb_may_pull-to-skb_gro_receive_list.patch
-git apply gro-fix-pskb_may_pull.patch
-```
-
-> [CVE-2026-53235][2] 是 Linux 内核 skb_gro_receive_list() 函数中的一个数据处理缺陷。<br>
-> 当某个特定序列的 TCP 段到达时，skb_gro_offset(skb) 大于 skb->len，skb_pull 中的 BUG_ON 触发，内核在 softirq 上下文崩溃。
-
 ### 3. 配置内核
 
 复用当前内核配置，自动补齐新参数：
+
+> 若当前内核低于 7.0 则应先安装高于等于7.0的内核再复制配置文件用于 `make olddefconfig`，
+对于 Oracle ARM 使用从 Oracle 7.0 内核提取的配置文件 [config-7.0.0-1013-oracle](configs/config-7.0.0-1013-oracle)
+
+
 ```bash
 # 拷贝当前系统配置
 cp /boot/config-$(uname -r) .config
@@ -123,7 +117,7 @@ make olddefconfig
 make LLVM=1 olddefconfig
 ```
 
-### 3. 编译内核
+### 4. 编译内核
 
 #### 首次编译
 
@@ -143,7 +137,7 @@ make -j$(nproc) LLVM=1 LLVM_IAS=1 \
 
 ```bash
 # 仅清理受影响的编译产物，大幅缩短编译时间
-rm -f net/core/gro.o net/ipv4/sysctl_net_ipv4.o net/ipv4/tcp_bbr.o net/ipv4/tcp_bbr.mod*
+rm -f net/ipv4/sysctl_net_ipv4.o net/ipv4/tcp_bbr.o net/ipv4/tcp_bbr.mod*
 # make...
 ```
 
@@ -153,11 +147,11 @@ rm -f net/core/gro.o net/ipv4/sysctl_net_ipv4.o net/ipv4/tcp_bbr.o net/ipv4/tcp_
 > - `REBUILD_DEBUG=0`：不生成调试符号，减小内核体积
 > - 如需指定特定 CPU（如 Neoverse-N1），可替换为 `-mcpu=neoverse-n1`
 
-### 4. 安装并启用
+### 5. 安装并启用
 
 ```bash
 # 安装内核包
- sudo dpkg -i ../linux-image-*.deb && sudo reboot
+sudo dpkg -i ../linux-image-*.deb && sudo reboot
 
 # 启用 LFN 优化（跨境链路示例）
 sudo tee /etc/sysctl.d/99-bbr-lfn.conf << EOF
@@ -175,7 +169,7 @@ sudo sysctl --system
 
 | 参数 | 默认值 | 取值范围 | 说明 |
 |------|--------|----------|------|
-| `net.ipv4.tcp_bbr_lfn_loss_thresh_pct` | 0 | 0-20 | 放宽后的最大丢包百分比；0=关闭；ECN ce_thresh 同步替换 |
+| `net.ipv4.tcp_bbr_lfn_loss_thresh_pct` | 0 | 0-20 | 放宽后的最大丢包百分比；0=关闭 |
 | `net.ipv4.tcp_bbr_lfn_min_rtt_fresh_ms` | 15000 | 0-60000 | min_rtt 最大有效年龄；0=不校验新鲜度；跨境建议 15000 |
 
 ### 推荐取值
@@ -211,7 +205,7 @@ sudo sysctl --system
 - **理由**: `fq` 的 pacing 机制与 BBR 原生协作，几乎不引入队列延迟，补丁豁免最充分。
 - **配置**: 无需特殊调整。
 
-> 💡 **深度解析**: 如需了解补丁与各类 AQM 交互的技术细节（如为何 CoDel 下 RTT 门限可能失效），请参阅项目文档 [doc/AQM_Compatibility.md](doc/Qdisc_Compatibility.md)。
+> 💡 **深度解析**: 如需了解补丁与各类 AQM 交互的技术细节（如为何 CoDel 下 RTT 门限可能失效），请参阅项目文档 [doc/Qdisc_Compatibility.md](doc/Qdisc_Compatibility.md)。
 
 ---
 
@@ -251,7 +245,7 @@ A: PROBE_UP 的 1.25× 爬坡 + abort 是 BBRv3 与 Reno/CUBIC 公平性的锚�
 物理丢包在 PROBE_UP 阶段导致的 abort 属于可接受的代价。
 
 ### Q: STARTUP 的 ≥6 discontiguous loss 没动，为什么？
-A: 6 这个数是 BBRv3 与 CUBIC 公平性论证的一部分，v3 只把 2%→pct 替换，6 保留，
+A: 6 这个数是 BBRv3 与 CUBIC 公平性论证的一部分，本补丁只把 2%→pct 替换，6 保留，
 这样即使 LFN 开 pct=7，只要 discontiguous loss <6 就不会 exit——更稳。
 
 ### Q：必须用 Clang 编译吗？
@@ -267,14 +261,18 @@ A：确认已加载新编译的内核，且 `net/ipv4/sysctl_net_ipv4.o` 已重�
 A：切换回原版内核，删除 `/etc/sysctl.d/99-bbr-lfn.conf` 即可，无需额外操作。
 
 ### Q：支持 OpenWrt 吗？
-A: 内核 ≥6.13 的 OpenWrt 可试，但 `sysctl_net_ipv4.c` 上下文可能已被 OpenWrt 自家补丁改过，
+A: 内核 ≥ 7.0 的 OpenWrt 可试，但 `sysctl_net_ipv4.c` 上下文可能已被 OpenWrt 自家补丁改过，
 需要手动调 hunk offset。
 
 ---
 
 ## 📝 版本更新日志
 
-### v3 (Current)
+### v4 (Current)
+- **切换到 Xanmod 7.3 源码**
+- **取消 ECN 放松**
+
+### v3
 - **ECN 对称放松**：对 loss 和 ECN 阈值进行对称放松。
 - **Upper Bound 豁免**：在 `bbr_adapt_upper_bounds()` 中，符合 LFN 条件时完全跳过 `inflight_hi` 冻结（v2 仅放松阈值），实现上下界对称豁免。
 - **Startup 优化**：Startup 阶段的丢包退出逻辑继承 pct 阈值，避免跨境链路因物理丢包过早切 DRAIN。
@@ -299,5 +297,5 @@ GPLv2，与 Linux 内核协议一致。
 
 💡 小贴士：如果发现任何问题或有改进建议，欢迎提交 Issue 或 PR！
 
-[1]: <https://github.com/google/bbr/blob/90210de4b779d40496dee0b89081780eeddf2a60/net/ipv4/tcp_bbr.c>
-[2]: <https://www.sentinelone.com/vulnerability-database/cve-2026-53235/>
+[1]: <https://gitlab.com/xanmod/linux/-/blob/452a42894aa66b564907246acb0d7cd946e15c51/net/ipv4/tcp_bbr.c>
+[2]: <https://gitlab.com/xanmod/linux/-/tree/31c6dfda49b408c1f5201bbe50554ef63bf08718>
